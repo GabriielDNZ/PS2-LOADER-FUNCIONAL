@@ -1223,10 +1223,10 @@ static int hid_LEDRumbleCommand(u8 *led, u8 lrum, u8 rrum, int pad)
         mips_memset(led_buf, 0, DS5_BT_REPORT_LEN + 2);
 
         led_buf[0] = HID_THDR_SET_REPORT_OUTPUT; // THdr
-        led_buf[1] = 0x31;                        // DS5 BT output report ID
-        led_buf[2] = 0x02;                        // seq_tag (incremented by host; 0 works fine)
-        led_buf[3] = 0xFF;                        // valid_flag0: rumble + LEDs
-        led_buf[4] = 0xF7;                        // valid_flag1: lightbar + player LEDs
+        led_buf[1] = 0x31;                       // DS5 BT output report ID
+        led_buf[2] = 0x02;                       // seq_tag (incremented by host; 0 works fine)
+        led_buf[3] = 0xFF;                       // valid_flag0: rumble + LEDs
+        led_buf[4] = 0xF7;                       // valid_flag1: lightbar + player LEDs
 
         led_buf[5] = rrum; // right (weak) rumble
         led_buf[6] = lrum; // left (strong) rumble
