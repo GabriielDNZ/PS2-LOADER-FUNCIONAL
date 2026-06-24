@@ -491,10 +491,12 @@ int vcdAutoDetectBdmaMode(int source)
         snprintf(src0, sizeof(src0), "%sPOPS/%s.%s", cands[i], vcdBdmaModule[0], suffix);
         snprintf(src1, sizeof(src1), "%sPOPS/%s.%s", cands[i], vcdBdmaModule[1], suffix);
         int f0 = open(src0, O_RDONLY);
-        if (f0 < 0) continue;
+        if (f0 < 0)
+            continue;
         close(f0);
         int f1 = open(src1, O_RDONLY);
-        if (f1 < 0) continue;
+        if (f1 < 0)
+            continue;
         close(f1);
         LOG("[BDMA] auto-detect: found %s variant for source %d\n", suffix, source);
         return mode; // exFAT variant files found
