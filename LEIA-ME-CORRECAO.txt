@@ -1,0 +1,13 @@
+Correção aplicada:
+
+1) Adicionado o arquivo que estava faltando:
+   ee_core/src/patches_asm.S
+
+2) Adicionado um script de segurança:
+   tools/ensure_patches_asm.sh
+
+3) Os workflows do GitHub Actions agora executam esse script depois do checkout.
+   Assim, se o arquivo patches_asm.S faltar no runner, ele é recriado antes do make.
+
+IMPORTANTE:
+Suba/commite estes arquivos no repositório do GitHub. Os logs enviados mostravam que o Actions ainda estava usando um commit sem ee_core/src/patches_asm.S.

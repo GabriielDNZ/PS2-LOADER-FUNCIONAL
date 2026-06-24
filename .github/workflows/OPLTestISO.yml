@@ -22,6 +22,8 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git fetch --prune --unshallow
 
+      - name: Ensure patches_asm.S exists
+        run: sh ./tools/ensure_patches_asm.sh
       - name: make ISO
         run: |
           cd labs/opltestiso/

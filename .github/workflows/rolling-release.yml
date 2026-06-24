@@ -49,6 +49,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Ensure patches_asm.S exists
+        run: sh ./tools/ensure_patches_asm.sh
       - name: Install git (ps2max image)
         run: |
           if command -v apt-get >/dev/null 2>&1; then
@@ -121,6 +123,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Ensure patches_asm.S exists
+        run: sh ./tools/ensure_patches_asm.sh
       - name: Install host dependencies (Alpine only)
         run: |
           if command -v apk >/dev/null 2>&1; then
@@ -204,6 +208,8 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Ensure patches_asm.S exists
+        run: sh ./tools/ensure_patches_asm.sh
       - name: Download pinned rolling assets
         uses: actions/download-artifact@v8
         with:

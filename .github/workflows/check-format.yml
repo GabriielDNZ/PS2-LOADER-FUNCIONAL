@@ -20,6 +20,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+      - name: Ensure patches_asm.S exists
+        run: sh ./tools/ensure_patches_asm.sh
       - uses: DoozyX/clang-format-lint-action@v0.18.2
         with:
           source: '.'
