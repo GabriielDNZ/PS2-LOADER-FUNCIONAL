@@ -1,0 +1,1602 @@
+#include "include/opl.h"
+#include "include/appsupport.h"
+#include "include/pad.h"
+#include "include/texcache.h"
+#include "include/textures.h"
+#include "include/gui.h"
+#include "include/util.h"
+#include "include/renderman.h"
+
+#include "include/tar.h"
+
+#include <delaythread.h>
+#include <kernel.h>
+#include <ps2sdkapi.h>
+#include <malloc.h>
+
+// Bridge: load a game's cover art from the ART/art.tar archive (gated by gEnableArtTar). Builds the
+// in-archive entry name (<value>_<suffix>.png -- the same name the loose ART/ file would have), pulls
+// the PNG bytes via the tar engine, and decodes them through the bounded memory path. Returns >= 0 on
+// a hit, -1 on any miss (no tar / entry absent / OOM / bad PNG) so the caller falls back to the loose
+// file. Runs on the art worker thread, like the loose-file load it replaces.
+static int artTarLoadImage(const char *value, const char *suffix, GSTEXTURE *texture)
+{
+    char name[64];
+    TarEntryBase *entry;
+    void *buf;
+    int result;
+
+    if (snprintf(name, sizeof(name), "%s_%s.png", value, suffix) >= (int)sizeof(name))
+        return -1; // longer than an ART entry name can be -> cannot match; use the loose file
+
+    entry = tarFind(TAR_KIND_ART, name);
+    if (entry == NULL)
+        return -1;
+
+    buf = malloc(entry->rawSize);
+    if (buf == NULL)
+        return -1;
+
+    if (tarRead(TAR_KIND_ART, entry, buf, entry->rawSize) != entry->rawSize) {
+        free(buf);
+        return -1;
+    }
+
+    result = texLoadFromMemory(texture, buf, entry->rawSize);
+    free(buf);
+    return result;
+}
+
+typedef struct load_image_request
+{
+    struct load_image_request *next;
+    image_cache_t *cache;
+    cache_entry_t *entry;
+    item_list_t *list;
+    int cacheUID;
+    int effectiveMode;
+    int generation;
+    volatile int abortRequested;
+    unsigned char priority;
+    GSTEXTURE texture;
+    char *value;
+} load_image_request_t;
+
+typedef struct cache_registry_entry
+{
+    image_cache_t *cache;
+    struct cache_registry_entry *next;
+} cache_registry_entry_t;
+
+enum {
+    CACHE_ENTRY_FREE = 0,
+    CACHE_ENTRY_QUEUED,
+    CACHE_ENTRY_LOADING,
+    CACHE_ENTRY_READY,
+    CACHE_ENTRY_PRIMED,
+    CACHE_ENTRY_DISPLAYABLE,
+    CACHE_ENTRY_FAILED
+};
+
+enum {
+    CACHE_REQ_PRIORITY_INTERACTIVE = 0,
+    CACHE_REQ_PRIORITY_PREFETCH
+};
+
+#define CACHE_SLOW_MODE_INTERACTIVE_DELAY 4
+#define CACHE_MMCE_INTERACTIVE_MAX_DELAY  12
+#define CACHE_MMCE_INTERACTIVE_DEBOUNCE   2
+#define CACHE_APP_INTERACTIVE_MAX_DELAY   4
+#define CACHE_APP_PREFETCH_DELAY          10
+#define CACHE_PRIME_IDLE_DELAY            12
+#define CACHE_THREAD_PRIORITY             0x40
+#define CACHE_MMCE_LOAD_THREAD_PRIORITY   90
+#define CACHE_END_WAIT_TICKS_FORCE        120
+#define CACHE_END_WAIT_TICKS_SOFT         15
+
+extern void *_gp;
+
+#define CACHE_THREAD_STACK_SIZE (96 * 1024)
+
+static u8 gArtThreadStack[CACHE_THREAD_STACK_SIZE] ALIGNED(16);
+static ee_thread_t gArtThread;
+static s32 gArtThreadId = -1;
+
+static s32 gArtSemaId = -1;
+static ee_sema_t gArtSema;
+
+static int gArtTerminate = 0;
+static int gArtRunning = 0;
+static int gArtShutdownAbandoned = 0;
+static int gArtQueuedCount = 0;
+static int gArtActiveCount = 0;
+static int gArtInteractiveActiveCount = 0;
+static int gCacheGeneration = 1;
+static load_image_request_t *gArtCurrentReq = NULL;
+static int gMmceInteractiveDebounceUntilFrame = -1;
+static char gMmceInteractiveDebounceValue[64];
+/* Navigation-active snapshot. getKey() mutates GUI-thread-only pad-repeat state,
+ * so the art worker thread must not call it; the GUI thread refreshes this flag
+ * (via cacheIsNavigationActive) each frame and the worker reads the snapshot. */
+static volatile int gNavInputActive = 0;
+
+static load_image_request_t *gArtInteractiveReqList = NULL;
+static load_image_request_t *gArtInteractiveReqEnd = NULL;
+static load_image_request_t *gArtPrefetchReqList = NULL;
+static load_image_request_t *gArtPrefetchReqEnd = NULL;
+static load_image_request_t *gArtCleanupReqList = NULL;
+static cache_registry_entry_t *gCacheRegistry = NULL;
+
+static void cacheClearItem(cache_entry_t *item, int freeTxt);
+static void cacheResetTextureState(GSTEXTURE *texture);
+static void cacheResetRequestTrackingLocked(void);
+static void cacheWakeWorker(void);
+static void cacheDropQueuedRequestLocked(load_image_request_t *req);
+
+static void cacheNextGenerationLocked(void)
+{
+    gCacheGeneration++;
+    if (gCacheGeneration <= 0)
+        gCacheGeneration = 1;
+}
+
+static void cacheLock(void)
+{
+    if (gArtSemaId >= 0)
+        WaitSema(gArtSemaId);
+}
+
+static void cacheUnlock(void)
+{
+    if (gArtSemaId >= 0)
+        SignalSema(gArtSemaId);
+}
+
+/* Lower the calling thread's priority below CACHE_MMCE_LOAD_THREAD_PRIORITY so
+ * that the art worker thread (which runs at that priority during MMCE reads) can
+ * be scheduled and complete or respond to an abort request.  Without this, any
+ * higher-priority caller busy-waiting in the wait loops would starve the art
+ * thread, causing every timed abort to time out and eventually forcing
+ * TerminateThread, which kills the art thread mid-fileXio call and leaves the
+ * RPC channel in a broken state.
+ *
+ * Returns the caller's original priority (to be passed to cacheRestoreCallerPriority),
+ * or -1 if the priority was already low enough / could not be determined.
+ *
+ * Non-static: also used by gui.c's guiHandleDeferedIO() so the GUI thread does not
+ * starve the art worker while busy-waiting for a deferred IO op (issue #45).
+ */
+int cacheLowerCallerPriority(void)
+{
+    ee_thread_status_t status;
+    int callerPriority = -1;
+
+    memset(&status, 0, sizeof(status));
+    if (ReferThreadStatus(GetThreadId(), &status) == 0) {
+        callerPriority = status.current_priority;
+        if (callerPriority < CACHE_MMCE_LOAD_THREAD_PRIORITY + 1)
+            ChangeThreadPriority(GetThreadId(), CACHE_MMCE_LOAD_THREAD_PRIORITY + 1);
+        else
+            callerPriority = -1; /* already low enough, nothing to restore */
+    }
+
+    return callerPriority;
+}
+
+void cacheRestoreCallerPriority(int savedPriority)
+{
+    if (savedPriority >= 0)
+        ChangeThreadPriority(GetThreadId(), savedPriority);
+}
+
+static void cacheWaitForWorkerTick(void)
+{
+    DelayThread(1000);
+}
+
+static void cacheRegister(image_cache_t *cache)
+{
+    cache_registry_entry_t *entry = malloc(sizeof(*entry));
+
+    if (entry == NULL)
+        return;
+
+    entry->cache = cache;
+
+    cacheLock();
+    entry->next = gCacheRegistry;
+    gCacheRegistry = entry;
+    cacheUnlock();
+}
+
+static void cacheUnregister(image_cache_t *cache)
+{
+    cache_registry_entry_t *entry;
+    cache_registry_entry_t *previous = NULL;
+
+    cacheLock();
+
+    entry = gCacheRegistry;
+    while (entry != NULL) {
+        if (entry->cache == cache) {
+            if (previous != NULL)
+                previous->next = entry->next;
+            else
+                gCacheRegistry = entry->next;
+
+            free(entry);
+            break;
+        }
+
+        previous = entry;
+        entry = entry->next;
+    }
+
+    cacheUnlock();
+}
+
+static void cacheResetTextureState(GSTEXTURE *texture)
+{
+    memset(texture, 0, sizeof(*texture));
+    texture->ClutStorageMode = GS_CLUT_STORAGE_CSM1;
+}
+
+static void cacheFreeRequest(load_image_request_t *req)
+{
+    if (req == NULL)
+        return;
+
+    /* req->texture is only ever decoded into EE RAM and struct-copied into the
+     * cache entry on success; it is never bound to VRAM via the TexManager.
+     * Free EE RAM only -- calling gsKit_TexManager_free (rmUnloadTexture) here
+     * would run on the art worker thread and race the GUI thread's per-frame
+     * TexManager list mutation. */
+    texFree(&req->texture);
+    cacheResetTextureState(&req->texture);
+    free(req);
+}
+
+static void cacheFinalizeRequestLocked(load_image_request_t *req)
+{
+    if (req != NULL && req->cache != NULL && req->cache->activeRequests > 0)
+        req->cache->activeRequests--;
+}
+
+static void cacheQueueCleanupRequestLocked(load_image_request_t *req)
+{
+    if (req == NULL)
+        return;
+
+    req->next = gArtCleanupReqList;
+    gArtCleanupReqList = req;
+}
+
+static void cacheProcessCleanupRequests(void)
+{
+    while (1) {
+        load_image_request_t *req;
+
+        cacheLock();
+        req = gArtCleanupReqList;
+        if (req != NULL) {
+            gArtCleanupReqList = req->next;
+            req->next = NULL;
+            cacheFinalizeRequestLocked(req);
+        }
+        cacheUnlock();
+
+        if (req == NULL)
+            break;
+
+        cacheFreeRequest(req);
+    }
+}
+
+static void cacheResetRequestTrackingLocked(void)
+{
+    cache_registry_entry_t *registry = gCacheRegistry;
+
+    gArtInteractiveReqList = NULL;
+    gArtInteractiveReqEnd = NULL;
+    gArtPrefetchReqList = NULL;
+    gArtPrefetchReqEnd = NULL;
+    gMmceInteractiveDebounceUntilFrame = -1;
+    gMmceInteractiveDebounceValue[0] = '\0';
+    gArtQueuedCount = 0;
+    gArtActiveCount = 0;
+    gArtInteractiveActiveCount = 0;
+
+    while (gArtCleanupReqList != NULL) {
+        load_image_request_t *req = gArtCleanupReqList;
+
+        gArtCleanupReqList = req->next;
+        req->next = NULL;
+        cacheFinalizeRequestLocked(req);
+        cacheFreeRequest(req);
+    }
+
+    while (registry != NULL) {
+        image_cache_t *cache = registry->cache;
+
+        if (cache != NULL) {
+            cache->activeRequests = 0;
+            cache->queuedPrefetchRequests = 0;
+        }
+
+        registry = registry->next;
+    }
+}
+
+static load_image_request_t **cacheGetQueueHead(unsigned char priority)
+{
+    return priority == CACHE_REQ_PRIORITY_PREFETCH ? &gArtPrefetchReqList : &gArtInteractiveReqList;
+}
+
+static load_image_request_t **cacheGetQueueTail(unsigned char priority)
+{
+    return priority == CACHE_REQ_PRIORITY_PREFETCH ? &gArtPrefetchReqEnd : &gArtInteractiveReqEnd;
+}
+
+static int cacheGetPrefetchLimit(const image_cache_t *cache)
+{
+    if (cache == NULL || cache->count <= 1)
+        return 0;
+
+    return cache->count - 1 < 4 ? cache->count - 1 : 4;
+}
+
+static int cacheShouldPreferLoadedVictim(const image_cache_t *cache, unsigned char priority, int effectiveMode)
+{
+    return cache != NULL && priority == CACHE_REQ_PRIORITY_INTERACTIVE && effectiveMode == MMCE_MODE &&
+           cache->suffix != NULL && strcmp(cache->suffix, "COV") == 0;
+}
+
+static int cacheGetEffectiveMode(const item_list_t *list, const char *value)
+{
+    int mode;
+
+    if (list == NULL)
+        return -1;
+
+    mode = list->mode;
+    if (mode == APP_MODE && value != NULL) {
+        int artMode = appGetArtMode(value);
+
+        if (artMode >= 0)
+            mode = artMode;
+    }
+
+    return mode;
+}
+
+static int cacheGetBaseDelay(const item_list_t *list)
+{
+    if (list != NULL && list->delay >= MENU_MIN_INACTIVE_FRAMES)
+        return list->delay;
+
+    return MENU_MIN_INACTIVE_FRAMES;
+}
+
+static int cacheGetInteractiveDelay(const item_list_t *list, const char *value)
+{
+    int delay = cacheGetBaseDelay(list);
+    int mode = cacheGetEffectiveMode(list, value);
+
+    if (list != NULL && list->mode == APP_MODE) {
+        if (mode != MMCE_MODE)
+            return 0;
+    }
+
+    if ((mode == APP_MODE || mode == MMCE_MODE) && delay < CACHE_SLOW_MODE_INTERACTIVE_DELAY)
+        delay = CACHE_SLOW_MODE_INTERACTIVE_DELAY;
+
+    if (list != NULL && list->mode == APP_MODE && delay > CACHE_APP_INTERACTIVE_MAX_DELAY)
+        delay = CACHE_APP_INTERACTIVE_MAX_DELAY;
+
+    if (mode == MMCE_MODE && delay > CACHE_MMCE_INTERACTIVE_MAX_DELAY)
+        delay = CACHE_MMCE_INTERACTIVE_MAX_DELAY;
+
+    return delay;
+}
+
+static int cacheGetPrefetchDelay(const item_list_t *list, const char *value)
+{
+    int delay = cacheGetBaseDelay(list);
+    int mode = cacheGetEffectiveMode(list, value);
+
+    if (mode == APP_MODE && delay < CACHE_APP_PREFETCH_DELAY)
+        delay = CACHE_APP_PREFETCH_DELAY;
+
+    return delay;
+}
+
+static int cacheHasPendingInteractiveArtLocked(void)
+{
+    return gArtInteractiveReqList != NULL || gArtInteractiveActiveCount > 0;
+}
+
+static int cacheHasQueuedInteractiveModeLocked(int mode)
+{
+    load_image_request_t *req;
+
+    for (req = gArtInteractiveReqList; req != NULL; req = req->next) {
+        if (req->effectiveMode == mode)
+            return 1;
+    }
+
+    return 0;
+}
+
+static int cacheHasActiveInteractiveModeLocked(int mode)
+{
+    return gArtCurrentReq != NULL && gArtCurrentReq->priority == CACHE_REQ_PRIORITY_INTERACTIVE && gArtCurrentReq->effectiveMode == mode;
+}
+
+static int cacheIsAbortableMmceRequest(load_image_request_t *req)
+{
+    return req != NULL && req->priority == CACHE_REQ_PRIORITY_INTERACTIVE && req->effectiveMode == MMCE_MODE;
+}
+
+static int cacheShouldDiscardCompletedRequestLocked(load_image_request_t *req)
+{
+    return cacheIsAbortableMmceRequest(req) && req->generation != gCacheGeneration;
+}
+
+static int cacheIsNavigationActive(void)
+{
+    /* getKey() mutates shared pad-repeat state, so only the GUI thread may call
+     * it. The art worker (which reaches here via cacheShouldDeferInteractiveArtOnInput
+     * while dequeuing) reads the most recent GUI-thread snapshot instead. The GUI
+     * thread evaluates this every frame while drawing the MMCE cover, keeping the
+     * snapshot fresh. */
+    if (gArtThreadId >= 0 && GetThreadId() == gArtThreadId)
+        return gNavInputActive;
+
+    gNavInputActive = (getKey(KEY_LEFT) || getKey(KEY_RIGHT) || getKey(KEY_UP) ||
+                       getKey(KEY_DOWN) || getKey(KEY_L1) || getKey(KEY_R1));
+    return gNavInputActive;
+}
+
+static int cacheShouldDeferInteractiveArtOnInput(const item_list_t *list, const char *value)
+{
+    int effectiveMode = cacheGetEffectiveMode(list, value);
+
+    if (list != NULL && effectiveMode == MMCE_MODE)
+        return cacheIsNavigationActive();
+
+    return 0;
+}
+
+static int cacheHasQueuedInteractiveMmceValueLocked(const char *value)
+{
+    load_image_request_t *req;
+
+    for (req = gArtInteractiveReqList; req != NULL; req = req->next) {
+        if (req->effectiveMode == MMCE_MODE && strcmp(req->value, value) == 0)
+            return 1;
+    }
+
+    return 0;
+}
+
+static void cacheDropQueuedInteractiveMmceDifferentValueLocked(const char *value)
+{
+    for (load_image_request_t *req = gArtInteractiveReqList, *next; req != NULL; req = next) {
+        next = req->next;
+        if (req->effectiveMode == MMCE_MODE && strcmp(req->value, value) != 0)
+            cacheDropQueuedRequestLocked(req);
+    }
+}
+
+static int cacheShouldDebounceMmceInteractiveLocked(int effectiveMode, const char *value)
+{
+    if (effectiveMode != MMCE_MODE || value == NULL)
+        return 0;
+
+    if (strcmp(gMmceInteractiveDebounceValue, value) != 0) {
+        snprintf(gMmceInteractiveDebounceValue, sizeof(gMmceInteractiveDebounceValue), "%s", value);
+        gMmceInteractiveDebounceUntilFrame = guiFrameId + CACHE_MMCE_INTERACTIVE_DEBOUNCE;
+        return 1;
+    }
+
+    return guiFrameId < gMmceInteractiveDebounceUntilFrame;
+}
+
+static int cacheGetLoadThreadPriority(const load_image_request_t *req)
+{
+    if (req != NULL && req->list != NULL) {
+        if (req->effectiveMode == MMCE_MODE)
+            return CACHE_MMCE_LOAD_THREAD_PRIORITY;
+
+        if (req->list->mode == APP_MODE)
+            return 0x38;
+    }
+
+    return CACHE_THREAD_PRIORITY;
+}
+
+static void cacheEnqueueRequestLocked(load_image_request_t *req)
+{
+    load_image_request_t **head;
+    load_image_request_t **tail;
+
+    req->next = NULL;
+    head = cacheGetQueueHead(req->priority);
+    tail = cacheGetQueueTail(req->priority);
+
+    if (*tail != NULL)
+        (*tail)->next = req;
+    else
+        *head = req;
+
+    *tail = req;
+    gArtQueuedCount++;
+
+    if (req->priority == CACHE_REQ_PRIORITY_PREFETCH && req->cache != NULL)
+        req->cache->queuedPrefetchRequests++;
+}
+
+static int cacheRemoveQueuedRequestLocked(load_image_request_t *target)
+{
+    load_image_request_t *req = *cacheGetQueueHead(target->priority);
+    load_image_request_t *previous = NULL;
+    load_image_request_t **head = cacheGetQueueHead(target->priority);
+    load_image_request_t **tail = cacheGetQueueTail(target->priority);
+
+    while (req != NULL) {
+        if (req == target) {
+            if (previous != NULL)
+                previous->next = req->next;
+            else
+                *head = req->next;
+
+            if (*tail == req)
+                *tail = previous;
+
+            req->next = NULL;
+            if (gArtQueuedCount > 0)
+                gArtQueuedCount--;
+
+            if (req->priority == CACHE_REQ_PRIORITY_PREFETCH && req->cache != NULL && req->cache->queuedPrefetchRequests > 0)
+                req->cache->queuedPrefetchRequests--;
+
+            return 1;
+        }
+
+        previous = req;
+        req = req->next;
+    }
+
+    return 0;
+}
+
+static void cacheDropQueuedRequestLocked(load_image_request_t *req)
+{
+    cache_entry_t *entry;
+
+    if (req == NULL)
+        return;
+
+    entry = req->entry;
+    if (entry != NULL && entry->qr == req) {
+        entry->qr = NULL;
+        if (entry->state == CACHE_ENTRY_QUEUED)
+            cacheClearItem(entry, 1);
+    }
+
+    if (cacheRemoveQueuedRequestLocked(req))
+        cacheQueueCleanupRequestLocked(req);
+}
+
+static void cachePromoteQueuedRequestLocked(load_image_request_t *req)
+{
+    if (req == NULL || req->priority != CACHE_REQ_PRIORITY_PREFETCH)
+        return;
+
+    if (!cacheRemoveQueuedRequestLocked(req))
+        return;
+
+    req->priority = CACHE_REQ_PRIORITY_INTERACTIVE;
+    cacheEnqueueRequestLocked(req);
+}
+
+static void cacheInvalidateEntryLocked(cache_entry_t *entry, int freeTxt, int preserveLoaded)
+{
+    load_image_request_t *req = entry->qr;
+
+    switch (entry->state) {
+        case CACHE_ENTRY_QUEUED:
+            entry->qr = NULL;
+            if (req != NULL && cacheRemoveQueuedRequestLocked(req))
+                cacheQueueCleanupRequestLocked(req);
+            cacheClearItem(entry, freeTxt);
+            break;
+        case CACHE_ENTRY_LOADING:
+            if (req != NULL) {
+                // Teardown (preserveLoaded==0) aborts everything. But a per-scroll generation advance
+                // (preserveLoaded==1) should only abort slow in-flight MMCE loads -- let a local
+                // BDM/HDD/USB cover or disc icon FINISH and land in cache instead of being cancelled and
+                // re-queued on every scroll step. With one art worker and #DiscType now adding a 2nd
+                // request per game, the blanket abort starved both cover and disc (temperamental loading).
+                if (!preserveLoaded || cacheIsAbortableMmceRequest(req))
+                    req->abortRequested = 1;
+            } else {
+                entry->qr = NULL;
+                cacheClearItem(entry, freeTxt);
+            }
+            break;
+        case CACHE_ENTRY_READY:
+        case CACHE_ENTRY_PRIMED:
+            if (preserveLoaded) {
+                entry->qr = NULL;
+                entry->state = CACHE_ENTRY_DISPLAYABLE;
+                entry->primeFrame = -1;
+            } else
+                cacheClearItem(entry, freeTxt);
+            break;
+        default:
+            break;
+    }
+}
+
+static void cacheInvalidatePendingRequestsLocked(int preserveLoaded)
+{
+    cache_registry_entry_t *registry = gCacheRegistry;
+
+    while (registry != NULL) {
+        image_cache_t *cache = registry->cache;
+
+        if (cache != NULL && !cache->destroying) {
+            for (int i = 0; i < cache->count; i++)
+                cacheInvalidateEntryLocked(&cache->content[i], 1, preserveLoaded);
+        }
+
+        registry = registry->next;
+    }
+}
+
+static void cacheInvalidateInteractiveRequestsLocked(void)
+{
+    cache_registry_entry_t *registry = gCacheRegistry;
+
+    while (registry != NULL) {
+        image_cache_t *cache = registry->cache;
+
+        if (cache != NULL && !cache->destroying) {
+            for (int i = 0; i < cache->count; i++) {
+                cache_entry_t *entry = &cache->content[i];
+                load_image_request_t *req = entry->qr;
+
+                if (req == NULL || req->priority != CACHE_REQ_PRIORITY_INTERACTIVE)
+                    continue;
+
+                switch (entry->state) {
+                    case CACHE_ENTRY_QUEUED:
+                        entry->qr = NULL;
+                        if (cacheRemoveQueuedRequestLocked(req))
+                            cacheQueueCleanupRequestLocked(req);
+                        cacheClearItem(entry, 1);
+                        break;
+                    case CACHE_ENTRY_LOADING:
+                        if (req != NULL)
+                            req->abortRequested = 1;
+                        else {
+                            entry->qr = NULL;
+                            cacheClearItem(entry, 1);
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        registry = registry->next;
+    }
+}
+
+static int cacheWaitForAllRequestsTimed(int timeoutTicks)
+{
+    int savedPriority;
+
+    if (!gArtRunning)
+        return 1;
+
+    savedPriority = cacheLowerCallerPriority();
+
+    while (timeoutTicks != 0) {
+        int pending;
+
+        cacheLock();
+        pending = (gArtQueuedCount > 0) || (gArtActiveCount > 0);
+        cacheUnlock();
+
+        if (!pending) {
+            cacheRestoreCallerPriority(savedPriority);
+            return 1;
+        }
+
+        cacheWaitForWorkerTick();
+        if (timeoutTicks > 0)
+            timeoutTicks--;
+    }
+
+    cacheRestoreCallerPriority(savedPriority);
+    return 0;
+}
+
+static void cacheWaitForCacheRequests(image_cache_t *cache)
+{
+    int savedPriority = cacheLowerCallerPriority();
+
+    while (1) {
+        int pending;
+
+        cacheLock();
+        pending = cache->activeRequests;
+        cacheUnlock();
+
+        if (!pending)
+            break;
+
+        cacheWaitForWorkerTick();
+    }
+
+    cacheRestoreCallerPriority(savedPriority);
+}
+
+static load_image_request_t *cacheFindQueuedRequestLocked(image_cache_t *cache, char *value)
+{
+    load_image_request_t *req;
+
+    for (req = gArtInteractiveReqList; req != NULL; req = req->next) {
+        if (req->cache == cache && strcmp(req->value, value) == 0)
+            return req;
+    }
+
+    for (req = gArtPrefetchReqList; req != NULL; req = req->next) {
+        if (req->cache == cache && strcmp(req->value, value) == 0)
+            return req;
+    }
+
+    return NULL;
+}
+
+static cache_entry_t *cacheFindLoadingEntryLocked(image_cache_t *cache, char *value, int *entryId)
+{
+    for (int i = 0; i < cache->count; i++) {
+        cache_entry_t *entry = &cache->content[i];
+        load_image_request_t *req;
+
+        if (entry->state != CACHE_ENTRY_LOADING || entry->qr == NULL)
+            continue;
+
+        req = (load_image_request_t *)entry->qr;
+        if (req->cache == cache && strcmp(req->value, value) == 0) {
+            if (entryId != NULL)
+                *entryId = i;
+            return entry;
+        }
+    }
+
+    return NULL;
+}
+
+static load_image_request_t *cacheDequeueRequest(void)
+{
+    load_image_request_t *req = NULL;
+
+    cacheLock();
+
+    if (gArtInteractiveReqList != NULL) {
+        if (cacheShouldDeferInteractiveArtOnInput(gArtInteractiveReqList->list, gArtInteractiveReqList->value)) {
+            cacheUnlock();
+            return NULL;
+        }
+
+        req = gArtInteractiveReqList;
+        gArtInteractiveReqList = req->next;
+        req->next = NULL;
+
+        if (gArtInteractiveReqEnd == req)
+            gArtInteractiveReqEnd = NULL;
+    } else if (gArtPrefetchReqList != NULL) {
+        req = gArtPrefetchReqList;
+        gArtPrefetchReqList = req->next;
+        req->next = NULL;
+
+        if (gArtPrefetchReqEnd == req)
+            gArtPrefetchReqEnd = NULL;
+    }
+
+    if (req != NULL) {
+        if (gArtQueuedCount > 0)
+            gArtQueuedCount--;
+        if (req->priority == CACHE_REQ_PRIORITY_PREFETCH && req->cache != NULL && req->cache->queuedPrefetchRequests > 0)
+            req->cache->queuedPrefetchRequests--;
+        gArtActiveCount++;
+        if (req->priority == CACHE_REQ_PRIORITY_INTERACTIVE)
+            gArtInteractiveActiveCount++;
+        gArtCurrentReq = req;
+
+        if (req->entry != NULL && req->entry->qr == req && req->entry->state == CACHE_ENTRY_QUEUED)
+            req->entry->state = CACHE_ENTRY_LOADING;
+    }
+
+    cacheUnlock();
+
+    return req;
+}
+
+static void cacheCompleteRequest(load_image_request_t *req, int result)
+{
+    cacheLock();
+
+    if (gArtCurrentReq == req)
+        gArtCurrentReq = NULL;
+
+    if (req->entry != NULL && req->entry->qr == req && req->entry->UID == req->cacheUID && req->cache != NULL && !req->cache->destroying) {
+        req->entry->qr = NULL;
+        req->entry->primeFrame = -1;
+
+        if (result == ERR_LOAD_ABORTED || cacheShouldDiscardCompletedRequestLocked(req)) {
+            cacheClearItem(req->entry, 0);
+        } else if (result < 0 || req->texture.Mem == NULL) {
+            req->entry->lastUsed = 0;
+            req->entry->state = CACHE_ENTRY_FAILED;
+        } else {
+            req->entry->texture = req->texture;
+            cacheResetTextureState(&req->texture);
+            req->entry->lastUsed = guiFrameId;
+            req->entry->state = CACHE_ENTRY_READY;
+        }
+    }
+
+    if (gArtActiveCount > 0)
+        gArtActiveCount--;
+    if (req->priority == CACHE_REQ_PRIORITY_INTERACTIVE && gArtInteractiveActiveCount > 0)
+        gArtInteractiveActiveCount--;
+
+    cacheFinalizeRequestLocked(req);
+    cacheUnlock();
+
+    cacheFreeRequest(req);
+}
+
+static void cacheLoadImage(load_image_request_t *req)
+{
+    ee_thread_status_t status;
+    int threadId;
+    int loadPriority;
+    int originalPriority = -1;
+    int result = -1;
+
+    if (req == NULL || req->cache == NULL || req->list == NULL || req->entry == NULL) {
+        cacheLock();
+        if (gArtCurrentReq == req)
+            gArtCurrentReq = NULL;
+        if (gArtActiveCount > 0)
+            gArtActiveCount--;
+        if (req != NULL && req->priority == CACHE_REQ_PRIORITY_INTERACTIVE && gArtInteractiveActiveCount > 0)
+            gArtInteractiveActiveCount--;
+        cacheFinalizeRequestLocked(req);
+        cacheUnlock();
+        cacheFreeRequest(req);
+        return;
+    }
+
+    if (req->abortRequested) {
+        cacheCompleteRequest(req, ERR_LOAD_ABORTED);
+        return;
+    }
+
+    threadId = GetThreadId();
+    loadPriority = cacheGetLoadThreadPriority(req);
+    memset(&status, 0, sizeof(status));
+    if (ReferThreadStatus(threadId, &status) == 0) {
+        originalPriority = status.current_priority;
+        if (originalPriority != loadPriority)
+            ChangeThreadPriority(threadId, loadPriority);
+    }
+
+    texSetLoadAbortFlag(&req->abortRequested);
+    // Art .tar (gEnableArtTar, default OFF): try the archive first; on any miss fall back to the loose
+    // ART/<id>_<suffix>.png read. When the toggle is off this is byte-for-byte the original behavior.
+    result = -1;
+    if (gEnableArtTar)
+        result = artTarLoadImage(req->value, req->cache->suffix, &req->texture);
+    if (result < 0)
+        result = req->list->itemGetImage(req->list, req->cache->prefix, req->cache->isPrefixRelative, req->value, req->cache->suffix, &req->texture, GS_PSM_CT24);
+    texSetLoadAbortFlag(NULL);
+    cacheCompleteRequest(req, result);
+    cacheProcessCleanupRequests();
+
+    if (originalPriority >= 0 && originalPriority != loadPriority)
+        ChangeThreadPriority(threadId, originalPriority);
+}
+
+static void cacheWorkerThread(void *arg)
+{
+    (void)arg;
+
+    while (!gArtTerminate) {
+        SleepThread();
+
+        if (gArtTerminate)
+            break;
+
+        cacheProcessCleanupRequests();
+
+        while (!gArtTerminate) {
+            load_image_request_t *req = cacheDequeueRequest();
+
+            if (req == NULL)
+                break;
+
+            cacheLoadImage(req);
+            cacheProcessCleanupRequests();
+        }
+    }
+
+    cacheLock();
+    gArtRunning = 0;
+    cacheUnlock();
+
+    ExitDeleteThread();
+}
+
+void cacheInit()
+{
+    if (gArtRunning)
+        return;
+
+    gArtTerminate = 0;
+    gArtShutdownAbandoned = 0;
+    gArtQueuedCount = 0;
+    gArtActiveCount = 0;
+    gArtInteractiveActiveCount = 0;
+    gCacheGeneration = 1;
+    gArtInteractiveReqList = NULL;
+    gArtInteractiveReqEnd = NULL;
+    gArtPrefetchReqList = NULL;
+    gArtPrefetchReqEnd = NULL;
+    gMmceInteractiveDebounceUntilFrame = -1;
+    gMmceInteractiveDebounceValue[0] = '\0';
+
+    gArtSema.init_count = 1;
+    gArtSema.max_count = 1;
+    gArtSema.option = 0;
+
+    gArtSemaId = CreateSema(&gArtSema);
+    if (gArtSemaId < 0)
+        return;
+
+    gArtThread.attr = 0;
+    gArtThread.stack_size = CACHE_THREAD_STACK_SIZE;
+    gArtThread.gp_reg = &_gp;
+    gArtThread.func = &cacheWorkerThread;
+    gArtThread.stack = gArtThreadStack;
+    gArtThread.initial_priority = CACHE_THREAD_PRIORITY;
+
+    gArtThreadId = CreateThread(&gArtThread);
+    if (gArtThreadId < 0) {
+        DeleteSema(gArtSemaId);
+        gArtSemaId = -1;
+        return;
+    }
+
+    gArtRunning = 1;
+    StartThread(gArtThreadId, NULL);
+}
+
+void cacheEnd(int forceStop)
+{
+    int waitTicks = forceStop ? CACHE_END_WAIT_TICKS_FORCE : CACHE_END_WAIT_TICKS_SOFT;
+    int savedPriority;
+
+    if (!gArtRunning)
+        return;
+
+    cacheLock();
+    cacheInvalidatePendingRequestsLocked(0);
+    cacheUnlock();
+
+    (void)cacheWaitForAllRequestsTimed(waitTicks);
+
+    gArtTerminate = 1;
+    WakeupThread(gArtThreadId);
+
+    savedPriority = cacheLowerCallerPriority();
+    for (int i = 0; gArtRunning && i < waitTicks; i++)
+        cacheWaitForWorkerTick();
+    cacheRestoreCallerPriority(savedPriority);
+
+    if (gArtRunning && gArtThreadId >= 0 && forceStop) {
+        TerminateThread(gArtThreadId);
+        DeleteThread(gArtThreadId);
+        gArtRunning = 0;
+    }
+
+    if (gArtRunning) {
+        gArtShutdownAbandoned = 1;
+        return;
+    }
+
+    /* Run the final cleanup under the real lock, THEN delete the semaphore.
+     * Deleting it first makes cacheLock()/cacheUnlock() no-ops, leaving this
+     * "Locked" cleanup running unlocked (safe today only because the worker
+     * thread has already exited here). */
+    cacheLock();
+    if (gArtCurrentReq != NULL) {
+        load_image_request_t *req = gArtCurrentReq;
+        gArtCurrentReq = NULL;
+        /* If the art thread was TerminateThread'd while holding this request,
+         * its cache entry is still in CACHE_ENTRY_LOADING with entry->qr
+         * pointing to req (about to be freed).  Clear it now so the slot is
+         * returned to the LRU pool and the dangling pointer can't cause
+         * use-after-free in future cacheInvalidateEntryLocked calls. */
+        if (req->entry != NULL && req->entry->qr == req)
+            cacheClearItem(req->entry, 0);
+        cacheFinalizeRequestLocked(req);
+        cacheFreeRequest(req);
+    }
+    cacheResetRequestTrackingLocked();
+    cacheUnlock();
+
+    if (gArtSemaId >= 0) {
+        DeleteSema(gArtSemaId);
+        gArtSemaId = -1;
+    }
+
+    gArtThreadId = -1;
+}
+
+static void cacheClearItem(cache_entry_t *item, int freeTxt)
+{
+    if (freeTxt && item->texture.Mem) {
+        rmUnloadTexture(&item->texture);
+        texFree(&item->texture);
+    }
+
+    memset(item, 0, sizeof(cache_entry_t));
+    cacheResetTextureState(&item->texture);
+    item->qr = NULL;
+    item->state = CACHE_ENTRY_FREE;
+    item->primeFrame = -1;
+    item->lastUsed = -1;
+    item->UID = 0;
+}
+
+image_cache_t *cacheInitCache(int userId, const char *prefix, int isPrefixRelative, const char *suffix, int count)
+{
+    image_cache_t *cache = malloc(sizeof(image_cache_t));
+
+    if (cache == NULL)
+        return NULL;
+
+    memset(cache, 0, sizeof(image_cache_t));
+    cache->userId = userId;
+    cache->count = count;
+
+    if (prefix != NULL) {
+        int length = strlen(prefix) + 1;
+        cache->prefix = malloc(length * sizeof(char));
+        if (cache->prefix == NULL) {
+            free(cache);
+            return NULL;
+        }
+        memcpy(cache->prefix, prefix, length);
+    }
+
+    cache->isPrefixRelative = isPrefixRelative;
+
+    {
+        int length = strlen(suffix) + 1;
+        cache->suffix = malloc(length * sizeof(char));
+        if (cache->suffix == NULL) {
+            free(cache->prefix);
+            free(cache);
+            return NULL;
+        }
+        memcpy(cache->suffix, suffix, length);
+    }
+
+    cache->nextUID = 1;
+    cache->allowPrime = 1;
+    cache->content = malloc(count * sizeof(cache_entry_t));
+    if (cache->content == NULL) {
+        free(cache->prefix);
+        free(cache->suffix);
+        free(cache);
+        return NULL;
+    }
+
+    for (int i = 0; i < count; ++i)
+        cacheClearItem(&cache->content[i], 0);
+
+    cacheRegister(cache);
+
+    return cache;
+}
+
+static void cacheWakeWorker(void)
+{
+    if (gArtRunning && gArtThreadId >= 0)
+        WakeupThread(gArtThreadId);
+}
+
+void cacheDestroyCache(image_cache_t *cache)
+{
+    if (cache == NULL)
+        return;
+
+    cacheLock();
+    cache->destroying = 1;
+
+    for (int i = 0; i < cache->count; ++i) {
+        cache_entry_t *entry = &cache->content[i];
+
+        cacheInvalidateEntryLocked(entry, 1, 0);
+        if (entry->state == CACHE_ENTRY_DISPLAYABLE || entry->state == CACHE_ENTRY_FAILED)
+            cacheClearItem(entry, 1);
+    }
+
+    cacheUnlock();
+    cacheWakeWorker();
+
+    if (gArtShutdownAbandoned)
+        return;
+
+    cacheWaitForCacheRequests(cache);
+    cacheUnregister(cache);
+
+    free(cache->prefix);
+    free(cache->suffix);
+    free(cache->content);
+    free(cache);
+}
+
+void cacheCancelPendingImageLoads(void)
+{
+    (void)cacheCancelPendingImageLoadsTimed(-1);
+}
+
+int cacheCancelPendingImageLoadsTimed(int timeoutTicks)
+{
+    cacheLock();
+    cacheInvalidatePendingRequestsLocked(0);
+    cacheUnlock();
+
+    cacheWakeWorker();
+    return cacheWaitForAllRequestsTimed(timeoutTicks);
+}
+
+int cacheAbortMmceImageLoadsTimed(int timeoutTicks)
+{
+    int savedPriority;
+
+    cacheLock();
+
+    if (gArtCurrentReq != NULL && cacheIsAbortableMmceRequest(gArtCurrentReq))
+        gArtCurrentReq->abortRequested = 1;
+
+    for (load_image_request_t *req = gArtInteractiveReqList, *next; req != NULL; req = next) {
+        next = req->next;
+        if (req->effectiveMode == MMCE_MODE)
+            cacheDropQueuedRequestLocked(req);
+    }
+
+    cacheUnlock();
+
+    cacheWakeWorker();
+
+    savedPriority = cacheLowerCallerPriority();
+
+    while (timeoutTicks != 0) {
+        int pending;
+
+        cacheLock();
+        pending = cacheHasActiveInteractiveModeLocked(MMCE_MODE) || cacheHasQueuedInteractiveModeLocked(MMCE_MODE);
+        cacheUnlock();
+
+        if (!pending) {
+            cacheRestoreCallerPriority(savedPriority);
+            return 1;
+        }
+
+        cacheWaitForWorkerTick();
+        if (timeoutTicks > 0)
+            timeoutTicks--;
+    }
+
+    cacheRestoreCallerPriority(savedPriority);
+    return 0;
+}
+
+void cacheAdvanceGeneration(void)
+{
+    cacheLock();
+    cacheInvalidatePendingRequestsLocked(1);
+    cacheNextGenerationLocked();
+    cacheUnlock();
+
+    cacheWakeWorker();
+}
+
+void cacheBumpGeneration(void)
+{
+    cacheLock();
+    cacheNextGenerationLocked();
+    cacheUnlock();
+}
+
+void cacheAdvanceGenerationPreservePrefetch(void)
+{
+    cacheLock();
+    cacheInvalidateInteractiveRequestsLocked();
+    cacheNextGenerationLocked();
+    cacheUnlock();
+
+    cacheWakeWorker();
+}
+
+void cachePrimeReadyTexture(void)
+{
+    GSTEXTURE *texture = NULL;
+    cache_registry_entry_t *registry;
+
+    if (guiInactiveFrames < CACHE_PRIME_IDLE_DELAY)
+        return;
+
+    cacheLock();
+
+    if (cacheHasPendingInteractiveArtLocked()) {
+        cacheUnlock();
+        return;
+    }
+
+    registry = gCacheRegistry;
+    while (registry != NULL && texture == NULL) {
+        image_cache_t *cache = registry->cache;
+
+        if (cache != NULL && !cache->destroying && cache->allowPrime) {
+            for (int i = 0; i < cache->count; i++) {
+                cache_entry_t *entry = &cache->content[i];
+
+                if (entry->state == CACHE_ENTRY_READY && entry->texture.Mem != NULL) {
+                    entry->state = CACHE_ENTRY_PRIMED;
+                    entry->primeFrame = guiFrameId;
+                    texture = &entry->texture;
+                    break;
+                }
+            }
+        }
+
+        registry = registry->next;
+    }
+
+    cacheUnlock();
+
+    if (texture != NULL)
+        rmPrimeTexture(texture);
+}
+
+int cacheHasPendingArt(void)
+{
+    int pending;
+
+    cacheLock();
+    pending = (gArtQueuedCount > 0) || (gArtActiveCount > 0);
+    cacheUnlock();
+
+    return pending;
+}
+
+int cacheHasPendingInteractiveArt(void)
+{
+    int pending;
+
+    cacheLock();
+    pending = cacheHasPendingInteractiveArtLocked();
+    cacheUnlock();
+
+    return pending;
+}
+
+void cacheWakeInteractiveArtOnInputIdle(void)
+{
+    int wakeWorker = 0;
+
+    cacheLock();
+    if (gArtRunning && gArtThreadId >= 0 && gArtActiveCount == 0 && gArtInteractiveReqList != NULL)
+        wakeWorker = 1;
+    cacheUnlock();
+
+    if (wakeWorker)
+        WakeupThread(gArtThreadId);
+}
+
+GSTEXTURE *cacheGetTextureIfReady(image_cache_t *cache, int *cacheId, int *UID)
+{
+    cache_entry_t *entry;
+    GSTEXTURE *result = NULL;
+
+    if (cache == NULL || cache->destroying || cacheId == NULL || UID == NULL || *cacheId < 0 || *cacheId >= cache->count)
+        return NULL;
+
+    cacheLock();
+
+    entry = &cache->content[*cacheId];
+    if (entry->UID == *UID) {
+        switch (entry->state) {
+            case CACHE_ENTRY_READY:
+                entry->state = CACHE_ENTRY_DISPLAYABLE;
+                entry->lastUsed = guiFrameId;
+                result = &entry->texture;
+                break;
+            case CACHE_ENTRY_PRIMED:
+                if (entry->primeFrame != guiFrameId) {
+                    entry->state = CACHE_ENTRY_DISPLAYABLE;
+                    entry->lastUsed = guiFrameId;
+                    result = &entry->texture;
+                }
+                break;
+            case CACHE_ENTRY_DISPLAYABLE:
+                entry->lastUsed = guiFrameId;
+                result = &entry->texture;
+                break;
+            default:
+                break;
+        }
+    } else {
+        *cacheId = -1;
+        *UID = -1;
+    }
+
+    cacheUnlock();
+
+    return result;
+}
+
+static GSTEXTURE *cacheGetTextureInternal(image_cache_t *cache, item_list_t *list, int *cacheId, int *UID, char *value, unsigned char priority)
+{
+    cache_entry_t *entry;
+    cache_entry_t *oldestEntry = NULL;
+    load_image_request_t *req;
+    GSTEXTURE *result = NULL;
+    int effectiveMode;
+    int oldestEntryId = -1;
+    int loadingEntryId = -1;
+    int rtime = guiFrameId;
+    int wakeWorker = 0;
+
+    if (cache == NULL || cache->destroying || value == NULL || value[0] == '\0')
+        return NULL;
+
+    cacheLock();
+    effectiveMode = cacheGetEffectiveMode(list, value);
+
+    if (*cacheId == -2) {
+        if (*UID == gCacheGeneration) {
+            cacheUnlock();
+            return NULL;
+        }
+
+        *cacheId = -1;
+        *UID = -1;
+    }
+
+    if (*cacheId != -1) {
+        entry = &cache->content[*cacheId];
+        if (entry->UID == *UID) {
+            switch (entry->state) {
+                case CACHE_ENTRY_QUEUED:
+                    if (priority == CACHE_REQ_PRIORITY_INTERACTIVE && entry->qr != NULL)
+                        cachePromoteQueuedRequestLocked((load_image_request_t *)entry->qr);
+                    cacheUnlock();
+                    return NULL;
+                case CACHE_ENTRY_LOADING:
+                    cacheUnlock();
+                    return NULL;
+                case CACHE_ENTRY_READY:
+                    entry->state = CACHE_ENTRY_DISPLAYABLE;
+                    entry->lastUsed = guiFrameId;
+                    result = &entry->texture;
+                    cacheUnlock();
+                    return result;
+                case CACHE_ENTRY_PRIMED:
+                    if (entry->primeFrame == guiFrameId) {
+                        cacheUnlock();
+                        return NULL;
+                    }
+                    entry->state = CACHE_ENTRY_DISPLAYABLE;
+                    entry->lastUsed = guiFrameId;
+                    result = &entry->texture;
+                    cacheUnlock();
+                    return result;
+                case CACHE_ENTRY_DISPLAYABLE:
+                    entry->lastUsed = guiFrameId;
+                    result = &entry->texture;
+                    cacheUnlock();
+                    return result;
+                case CACHE_ENTRY_FAILED:
+                    *cacheId = -2;
+                    *UID = gCacheGeneration;
+                    cacheUnlock();
+                    return NULL;
+                default:
+                    *cacheId = -1;
+                    break;
+            }
+        } else {
+            *cacheId = -1;
+        }
+    }
+
+    if (priority == CACHE_REQ_PRIORITY_INTERACTIVE) {
+        if (cacheShouldDeferInteractiveArtOnInput(list, value) ||
+            cacheShouldDebounceMmceInteractiveLocked(effectiveMode, value)) {
+            cacheUnlock();
+            return NULL;
+        }
+
+        {
+            int delay = cacheGetInteractiveDelay(list, value);
+            /* In MMCE mode, give Cover art a 1-frame inactivity head start over
+             * other art types (Background, Screenshot, etc.).  The default theme
+             * draws Background (main0) before Cover (main5) every frame, so
+             * without this adjustment BG would always queue first and block COV
+             * with a potentially slow open() failure on cards that lack BG art.
+             * A single extra inactivity frame guarantees COV queues on frame N
+             * while BG/SCR are deferred to frame N+1, by which time COV is
+             * already in-flight and the MMCE one-at-a-time throttle keeps the
+             * others waiting naturally. */
+            if (effectiveMode == MMCE_MODE && cache->suffix != NULL &&
+                strcmp(cache->suffix, "COV") != 0)
+                delay++;
+            if (guiInactiveFrames < delay) {
+                cacheUnlock();
+                return NULL;
+            }
+        }
+    } else {
+        if (list == NULL || effectiveMode == MMCE_MODE || guiInactiveFrames < cacheGetPrefetchDelay(list, value)) {
+            cacheUnlock();
+            return NULL;
+        }
+
+        if (list->mode == APP_MODE && cacheHasPendingInteractiveArtLocked()) {
+            cacheUnlock();
+            return NULL;
+        }
+    }
+
+    req = cacheFindQueuedRequestLocked(cache, value);
+    if (req != NULL && req->entry != NULL) {
+        if (priority == CACHE_REQ_PRIORITY_INTERACTIVE) {
+            cachePromoteQueuedRequestLocked(req);
+            if (!cacheShouldDeferInteractiveArtOnInput(list, value))
+                wakeWorker = 1;
+        }
+
+        *cacheId = req->entry - cache->content;
+        *UID = req->entry->UID;
+        cacheUnlock();
+        if (wakeWorker)
+            cacheWakeWorker();
+        return NULL;
+    }
+
+    entry = cacheFindLoadingEntryLocked(cache, value, &loadingEntryId);
+    if (entry != NULL) {
+        *cacheId = loadingEntryId;
+        *UID = entry->UID;
+        cacheUnlock();
+        return NULL;
+    }
+
+    if (priority == CACHE_REQ_PRIORITY_INTERACTIVE && list != NULL && effectiveMode == MMCE_MODE) {
+        cacheDropQueuedInteractiveMmceDifferentValueLocked(value);
+
+        if ((gArtCurrentReq != NULL && cacheIsAbortableMmceRequest(gArtCurrentReq) && strcmp(gArtCurrentReq->value, value) != 0) &&
+            cacheHasQueuedInteractiveMmceValueLocked(value)) {
+            cacheUnlock();
+            return NULL;
+        }
+    }
+
+    if (priority == CACHE_REQ_PRIORITY_PREFETCH && cache->queuedPrefetchRequests >= cacheGetPrefetchLimit(cache)) {
+        cacheUnlock();
+        return NULL;
+    }
+
+    if (cacheShouldPreferLoadedVictim(cache, priority, effectiveMode)) {
+        for (int i = 0; i < cache->count; i++) {
+            entry = &cache->content[i];
+            if ((entry->state == CACHE_ENTRY_READY || entry->state == CACHE_ENTRY_PRIMED ||
+                 entry->state == CACHE_ENTRY_DISPLAYABLE || entry->state == CACHE_ENTRY_FAILED) &&
+                entry->lastUsed < rtime) {
+                oldestEntry = entry;
+                oldestEntryId = i;
+                rtime = entry->lastUsed;
+            }
+        }
+    }
+
+    if (oldestEntry == NULL) {
+        rtime = guiFrameId;
+        for (int i = 0; i < cache->count; i++) {
+            entry = &cache->content[i];
+            if ((entry->state == CACHE_ENTRY_FREE || entry->state == CACHE_ENTRY_READY || entry->state == CACHE_ENTRY_PRIMED ||
+                 entry->state == CACHE_ENTRY_DISPLAYABLE || entry->state == CACHE_ENTRY_FAILED) &&
+                entry->lastUsed < rtime) {
+                oldestEntry = entry;
+                oldestEntryId = i;
+                rtime = entry->lastUsed;
+            }
+        }
+    }
+
+    if (oldestEntry == NULL || !gArtRunning) {
+        cacheUnlock();
+        return NULL;
+    }
+
+    req = malloc(sizeof(load_image_request_t) + strlen(value) + 1);
+    if (req == NULL) {
+        cacheUnlock();
+        return NULL;
+    }
+
+    memset(req, 0, sizeof(load_image_request_t));
+    cacheResetTextureState(&req->texture);
+
+    req->cache = cache;
+    req->entry = oldestEntry;
+    req->list = list;
+    req->effectiveMode = effectiveMode;
+    req->priority = priority;
+    req->generation = gCacheGeneration;
+    req->value = (char *)req + sizeof(load_image_request_t);
+    strcpy(req->value, value);
+    req->cacheUID = cache->nextUID;
+
+    /* Release the displaced texture using the SAME GSTEXTURE pointer
+     * that gsKit_TexManager_bind registered (&oldestEntry->texture).
+     * Earlier variants of this code copied the GSTEXTURE struct into
+     * either a stack local or a req->displacedTexture heap field and
+     * called gsKit_TexManager_free on that copy.  PS2SDK keys its LL
+     * lookup by GSTEXTURE pointer identity, so neither address ever
+     * matched the registered entry: VRAM was silently leaked while
+     * EE RAM was correctly freed.  Across many APPS/MMCE cover
+     * navigations the leaks accumulated until gsKit's internal LRU
+     * evicted other live textures (e.g. the theme background) to make
+     * room, producing the purple/vertical artifacting reported on
+     * APPS and MMCE pages.  cacheClearItem() is the established
+     * release pattern used by every other site in this file. */
+    cacheClearItem(oldestEntry, 1);
+    oldestEntry->qr = req;
+    oldestEntry->state = CACHE_ENTRY_QUEUED;
+    oldestEntry->UID = cache->nextUID;
+
+    *cacheId = oldestEntryId;
+    *UID = cache->nextUID++;
+
+    cache->activeRequests++;
+    cacheEnqueueRequestLocked(req);
+    cacheUnlock();
+
+    cacheWakeWorker();
+
+    return NULL;
+}
+
+GSTEXTURE *cacheGetTexture(image_cache_t *cache, item_list_t *list, int *cacheId, int *UID, char *value)
+{
+    return cacheGetTextureInternal(cache, list, cacheId, UID, value, CACHE_REQ_PRIORITY_INTERACTIVE);
+}
+
+GSTEXTURE *cachePrefetchTexture(image_cache_t *cache, item_list_t *list, int *cacheId, int *UID, char *value)
+{
+    return cacheGetTextureInternal(cache, list, cacheId, UID, value, CACHE_REQ_PRIORITY_PREFETCH);
+}
